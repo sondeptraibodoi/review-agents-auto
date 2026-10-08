@@ -1,0 +1,6 @@
+{
+  "endpoints": [
+    {"path": "/api/v1/health", "method": "GET", "expected_status": 200, "required_keys": ["status"], "max_ms": 3000},
+    {"path": "/api/v1/me", "method": "GET", "expected_status": 200, "required_keys": ["data"]}
+  ]
+}
