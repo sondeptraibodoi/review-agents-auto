@@ -1,11 +1,11 @@
-# Lean Review Agents v0.3.0
+# Lean Review Agents v0.4.0
 
-**Cross-platform, local-first reviewer** for Git changes, PHP/Laravel backend checks, PostgreSQL/MySQL metadata/query plans, HTTP API contracts and Playwright visual UI testing.
+**Cross-platform, local-first reviewer** for Git changes, multi-language backend/frontend checks, PostgreSQL/MySQL metadata/query plans, HTTP API contracts and Playwright visual UI testing.
 
 - Python **3.10+**, Windows / macOS / Linux. No Docker or cloud service is required.
 - **Zero AI tokens by default.** `--ai` and `ui ai` opt into Codex when installed. Local database metadata, CLI tests and API probes never call a model.
 - Nothing is automatically pushed to GitHub/GitLab; the tool does not run migrations, write DB rows, auto-fix code or post PR comments.
-- **Not production-certified.** Offline tests, simulated DB-driver tests and a local HTTP server test pass. Live PostgreSQL/MySQL connections, Codex, Windows/macOS CI runs have not been independently validated here.
+- **Not production-certified.** Automated local tests and simulated database driver tests pass. Live PostgreSQL/MySQL connections, Codex, Windows/macOS CI runs have not been independently validated here.
 
 ## Install
 
@@ -37,6 +37,52 @@ Install only needed pieces to keep it light:
 | `.[all]` | all optional | Everything |
 
 PHP checks need your PHP project to have installed Composer dependencies, `php` in PATH and `vendor/bin/phpunit` / `vendor/bin/phpstan`. No Composer installation is performed by LeanReview.
+
+## New in 0.4: multi-language review engine
+
+No separate installers or Docker images are required for detection: **Python 3.10+ and Git** are sufficient. Each language-specific check still requires its locally installed toolchain and your project's dependencies. The CLI will **never** automatically run `npm install`, Composer, pip, Cargo downloads, Maven downloads, or `npx` to fetch missing checkers.
+
+| Ecosystem | Detected by | Local checks (when installed / configured) |
+| --- | --- | --- |
+| PHP / Laravel / Symfony | `composer.json`, `artisan` | PHPUnit / PHPStan (project-local Composer binaries) |
+| Node / Angular / React / Vue / NestJS / Express | `package.json` | package manager `lint`, `typecheck`, `test:ci` / `test:unit` / `test`; local `tsc` fallback |
+| Python / Django / FastAPI / Flask | `pyproject.toml`, `requirements.txt`, `manage.py` | Ruff, pytest, mypy |
+| Go / Gin / Fiber | `go.mod` | `go test ./...`, `go vet ./...` |
+| Rust | `Cargo.toml` | `cargo test --offline --locked`, `cargo clippy` |
+| Java / Spring Boot | Maven POM or Gradle files | `mvn --offline ... test`, `gradle --offline test` |
+| C# / ASP.NET Core | `.sln`, `.csproj` | `dotnet test --no-restore` |
+
+Discovery includes the root plus immediate `backend/`, `frontend/`, `api/`, `web/`, `server/`, `client/`, and one level within `apps/`, `packages/`, `services/`, `libs/`. It stops at `--max-projects` (default 12), does not follow workspace symlinks and does not recursively search `node_modules` or `vendor`. Deep/complex workspaces need additional configuration in a future version.
+
+```powershell
+# Run at your project's root, on Windows PowerShell
+leanreview detect                                # inspect manifest files only: does NOT run project code
+leanreview check                                 # plan local checks; DOES NOT execute scripts
+leanreview check --only lint --run                 # execute configured local lint checks
+leanreview check --only test --run --timeout 180   # execute local tests
+leanreview review --all                           # diff review + execute detected local checks
+leanreview review --base origin/main --all --ai --ai-on warnings --max-tokens 2500
+```
+
+`review --all` runs local test/lint/typecheck commands by explicit request; `--ai` is **still opt-in**. AI sees only the selected, redacted Git patch (not the full project, databases, test logs or API results). `--max-tokens` approximates patch text, *not* the full billed context including model prompts/output. Results of local commands have **0 AI tokens**. AI caches by patch/model.
+
+**Safety:** project test scripts can perform arbitrary actions, including database writes, email delivery, external HTTP requests or running arbitrary executables. Although LeanReview invokes tools with `shell=False`, a project's own scripts can use shells or network. Run checks only on trusted projects with a dedicated test DB; the runner is **not a sandbox or network firewall**. `--offline` / `GOPROXY=off` is applied where supported but Node/PHP/Python scripts may still make requests themselves. Local output is trimmed and best-effort redacted; do not upload reports containing secrets. Missing checkers are recorded as **skipped**, never counted as passed.
+
+`review` looks at unstaged, already tracked changes by default; use `--staged` to review `git add`-ed changes, or `--base origin/main` for a branch diff. **New untracked files are not included until added to Git.** The diff-based AI reviewer is heuristic and does not guarantee detection of all bugs.
+
+On Windows where `py` works but `python` or `leanreview` is not on PATH:
+
+```powershell
+py -m pip install -e ".[all]"
+$scripts = py -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+& "$scripts\leanreview.exe" doctor
+```
+
+### Exit codes
+
+- `0`: checks passed, or a plan/discovery ran without executing checks.
+- `1`: at least one local check failed/timed out (with `check --run` or `review --all`).
+- `2`: invalid configuration, runtime error, or no applicable checks executed (`check --run`).
 
 ## 1. Code review (Git diff)
 

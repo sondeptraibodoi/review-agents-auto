@@ -25,12 +25,27 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("--max-tokens", type=int, default=5000, help="Estimated patch-only token cap")
     r.add_argument("--max-files", type=int, default=30)
     r.add_argument("--ai", action="store_true", help="Optional single Codex pass")
+    r.add_argument("--all", action="store_true", help="Run detected project lint/typecheck/tests offline-first (trusted project only)")
+    r.add_argument("--check-timeout", type=int, default=120, help="Per-check time limit in seconds for --all")
+    r.add_argument("--max-projects", type=int, default=12, help="Maximum detected root/workspace projects")
     r.add_argument("--ai-on", choices=["always", "warnings"], default="always",
                    help="When --ai: always call AI or only when offline rules flag something")
     r.add_argument("--model", help="Codex model")
     r.add_argument("--no-cache", action="store_true")
     r.add_argument("--format", choices=["text", "json"], default="text")
     r.add_argument("--output", type=Path)
+    detect = sub.add_parser("detect", help="Identify project languages/frameworks without executing anything")
+    detect.add_argument("--repo", type=Path, default=Path.cwd())
+    detect.add_argument("--max-projects", type=int, default=12)
+    detect.add_argument("--output", type=Path)
+    check = sub.add_parser("check", help="Plan or run local checks for many languages")
+    check.add_argument("--repo", type=Path, default=Path.cwd())
+    check.add_argument("--run", action="store_true", help="Run test/lint commands (trusted project + test database only)")
+    check.add_argument("--only", choices=["all", "lint", "test", "typecheck"], default="all")
+    check.add_argument("--timeout", type=int, default=120)
+    check.add_argument("--output-limit", type=int, default=4000)
+    check.add_argument("--max-projects", type=int, default=12)
+    check.add_argument("--output", type=Path)
     u = sub.add_parser("ui", help="UI audits, human annotation and optional Lavish integration")
     ui = u.add_subparsers(dest="ui_command", required=True)
     a = ui.add_parser("audit", help="Check a running web app at multiple viewport sizes")
@@ -107,6 +122,13 @@ def format_text(data: dict) -> str:
             lines.append(f"[AI:{f['severity']}] {f['file']}:{f['line']} {f['issue']} => {f['suggestion']}")
     if data["ai_cache_hit"]:
         lines.append("AI cache hit: reused locally cached result (no new model call)")
+    checks = data.get("local_checks")
+    if checks is not None:
+        counts = checks["counts"]
+        lines.append("Local checks: " + ", ".join(f"{key}={value}" for key, value in counts.items()))
+        for check in checks["checks"]:
+            if check["status"] in {"failed", "timeout", "error"}:
+                lines.append(f"[{check['status']}] {check['project']}: {check['tool']}")
     if not data["offline_findings"] and not (data["ai"] and data["ai"].get("findings")):
         lines.append("No findings from enabled checks (not proof of correctness)")
     return "\n".join(lines) + "\n"
@@ -118,8 +140,15 @@ def review(args) -> int:
     repo = args.repo.resolve()
     selected = slice_diff(get_diff(repo, args.base, args.staged), args.max_tokens * 4, args.max_files)
     offline = offline_findings(selected.patch)
+    check_report = None
+    if args.all:
+        from .multilang import run_checks
+        check_report = run_checks(repo, timeout=args.check_timeout, max_projects=args.max_projects,
+                                  execute=True)
     ai, cached = None, False
-    if args.ai and selected.patch and (args.ai_on == "always" or offline):
+    check_problems = check_report is not None and any(
+        check_report["counts"].get(state, 0) for state in ("failed", "error", "timeout"))
+    if args.ai and selected.patch and (args.ai_on == "always" or offline or check_problems):
         cp = cache_file(repo, selected.sha256, "codex", args.model or "default")
         if cp.is_file() and not args.no_cache:
             try:
@@ -131,12 +160,15 @@ def review(args) -> int:
             ai = codex_review(selected.patch, repo, args.model)
             write_private_json(cp, ai)
     data = output_report(selected, offline, ai, cached)
+    if check_report is not None:
+        data["local_checks"] = check_report
+        data["note"] += " Local test commands may have side effects; use trusted code and a test DB."
     txt = json.dumps(data, ensure_ascii=False, indent=2) + "\n" if args.format == "json" else format_text(data)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(txt, encoding="utf-8")
     print(txt, end="")
-    return 0
+    return 1 if check_problems else 0
 
 
 def ui_cmd(args) -> int:
@@ -240,11 +272,33 @@ def api_cmd(args) -> int:
     return 0 if report["passed"] == report["total"] else 1
 
 
+def detect_cmd(args) -> int:
+    from .multilang import discover
+    projects = discover(args.repo, max_projects=args.max_projects)
+    for item in projects:
+        item.pop("_package", None)
+    save_output({"repo": str(args.repo.resolve()), "projects": projects,
+                 "token_cost": 0, "note": "No project commands executed"}, args.output)
+    return 0
+
+
+def check_cmd(args) -> int:
+    from .multilang import run_checks
+    report = run_checks(args.repo, timeout=args.timeout, output_limit=args.output_limit,
+                        max_projects=args.max_projects, kind=args.only, execute=args.run)
+    save_output(report, args.output)
+    if not args.run:
+        return 0
+    if report["counts"]["failed"] or report["counts"]["timeout"] or report["counts"]["error"]:
+        return 1
+    return 2 if report["executed"] == 0 else 0
+
+
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
     if args.command == "doctor":
         print(f"LeanReview {__version__} | Python {platform.python_version()} | {platform.system()}")
-        for cmd in ("git", "codex", "npx", "php"):
+        for cmd in ("git", "codex", "npx", "php", "npm", "pnpm", "yarn", "bun", "go", "cargo", "mvn", "gradle", "dotnet"):
             print(f"{cmd}: {shutil.which(cmd) or 'not installed (some features optional)'}")
         for mod in ("psycopg", "pymysql"):
             try:
@@ -261,6 +315,10 @@ def main(argv=None) -> int:
     try:
         if args.command == "review":
             return review(args)
+        if args.command == "detect":
+            return detect_cmd(args)
+        if args.command == "check":
+            return check_cmd(args)
         if args.command == "ui":
             return ui_cmd(args)
         if args.command == "db":
